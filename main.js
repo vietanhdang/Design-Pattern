@@ -30,35 +30,35 @@
 // |------------------------------------------------------------------------------------------------|
 // | Observer           | Behavioral       | Subject: Đối tượng cần được theo dõi, duy trì danh     |
 // | Pattern            |                  |           sách các Observer và cung cấp các            |
-// |                    |                  |           phương thức để thêm, xóa và thông báo    	  |
-// |                    |                  |           cho các Observer khi có sự thay đổi.     	  |
-// |                    |                  | Concrete Subject: Lớp triển khai của Subject,      	  |
+// |                    |                  |           phương thức để thêm, xóa và thông báo    	|
+// |                    |                  |           cho các Observer khi có sự thay đổi.     	|
+// |                    |                  | Concrete Subject: Lớp triển khai của Subject,      	|
 // |                    |                  |                  chứa thông tin trạng thái và khi      |
 // |                    |                  |                  trạng thái thay đổi, thông báo cho    |
-// |                    |                  |                  các Observer đã đăng ký.           	  |
-// |                    |                  | Observer: Interface hoặc lớp trừu tượng đại diện   	  |
-// |                    |                  |           cho các đối tượng quan sát Subject,      	  |
-// |                    |                  |           chứa phương thức update() để nhận thông  	  |
-  // |                    |                  |           báo từ Subject khi có sự thay đổi.        	|
-// |                    |                  | Concrete Observer: Các lớp triển khai của Observer,	  |
-// |                    |                  |                    cập nhật trạng thái của mình khi	  |
-// |                    |                  |                    nhận thông báo từ Subject.       	  |
+// |                    |                  |                  các Observer đã đăng ký.           	|
+// |                    |                  | Observer: Interface hoặc lớp trừu tượng đại diện   	|
+// |                    |                  |           cho các đối tượng quan sát Subject,      	|
+// |                    |                  |           chứa phương thức update() để nhận thông  	|
+  // |                    |                  |           báo từ Subject khi có sự thay đổi.      	|
+// |                    |                  | Concrete Observer: Các lớp triển khai của Observer,	|
+// |                    |                  |                    cập nhật trạng thái của mình khi	|
+// |                    |                  |                    nhận thông báo từ Subject.       	|
 // |------------------------------------------------------------------------------------------------|
 // | Mediator           | Behavioral       | Mediator: Interface hoặc lớp trừu tượng chứa các  	    |
 // | Pattern            |                  |            phương thức để xử lý giao tiếp giữa các	    |
-// |                    |                  |            đối tượng.                            		  |
-// |                    |                  | Concrete Mediator: Lớp triển khai của Mediator,  		  |
+// |                    |                  |            đối tượng.                            		|
+// |                    |                  | Concrete Mediator: Lớp triển khai của Mediator,  		|
 // |                    |                  |                   quản lý việc trao đổi thông tin 	    |
-// |                    |                  |                   giữa các đối tượng.            		  |
+// |                    |                  |                   giữa các đối tượng.            		|
 // |                    |                  | Colleague: Interface hoặc lớp trừu tượng đại diện 	    |
 // |                    |                  |           cho các đối tượng cần giao tiếp với nhau	    |
-// |                    |                  |           thông qua Mediator.                    		  |
+// |                    |                  |           thông qua Mediator.                    		|
 // |                    |                  | Concrete Colleagues: Các lớp triển khai của       	    |
-// |                    |                  |                      Colleague, gửi thông điệp   		  |
+// |                    |                  |                      Colleague, gửi thông điệp   		|
 // |                    |                  |                      tới Mediator và nhận thông   	    |
-// |                    |                  |                      điệp từ Mediator.           		  |
+// |                    |                  |                      điệp từ Mediator.           		|
 // |------------------------------------------------------------------------------------------------|
-// | State              | Behavioral       | State: Interface hoặc lớp trừu tượng đại diện cho  	  |
+// | State              | Behavioral       | State: Interface hoặc lớp trừu tượng đại diện cho  	|
 // | Pattern            |                  |         các trạng thái của đối tượng, chứa các   	    |
 // |                    |                  |         phương thức tương ứng với các hành vi          |
 // |                    |                  |         cụ thể dựa trên trạng thái hiện tại của        |
