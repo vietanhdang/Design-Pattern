@@ -18,6 +18,7 @@ namespace WindowsFormsApp1.Models
 {
     public class EInvoiceCrawler
     {
+
         /// <summary>
         /// Địa chỉ API hóa đơn điện tử
         /// </summary>
@@ -57,16 +58,20 @@ namespace WindowsFormsApp1.Models
         /// Quản lý các yêu cầu HTTP
         /// </summary>
         private HttpClientHandler _handler { get; set; }
+
         public EInvoiceCrawler(string taxcode, string username, string password)
         {
             _taxcode = taxcode;
             _username = username;
             _password = password;
         }
+
         public EInvoiceCrawler()
         {
 
         }
+
+        public ProgressBarManager ProgressBarManager { get; set; }
 
         /// <summary>
         /// Check token theo mst xem có còn thời hạn không
@@ -75,7 +80,11 @@ namespace WindowsFormsApp1.Models
         {
             try
             {
-                string[] files = Directory.GetFiles(Application.StartupPath, $"{_taxcode}_Token_*.txt");
+                if (!Directory.Exists(FileUtil.TOKEN_PATH))
+                {
+                    Directory.CreateDirectory(FileUtil.TOKEN_PATH);
+                }
+                string[] files = Directory.GetFiles(FileUtil.TOKEN_PATH, $"{_taxcode}_Token_*.txt");
                 bool forceGetToken = true; // biến này dùng để check xem có lấy token mới không
                 // nếu tìm thấy token thì check expired timestamp
                 if (files.Length > 0)
@@ -84,8 +93,7 @@ namespace WindowsFormsApp1.Models
                     string fileName = Path.GetFileNameWithoutExtension(tokenPath);
                     string[] fileNameParts = fileName.Split('_');
                     string expirationUnixTimeStr = fileNameParts[fileNameParts.Length - 1];
-                    var expirationUnixTime = 0;
-                    int.TryParse(expirationUnixTimeStr, out expirationUnixTime);
+                    int.TryParse(expirationUnixTimeStr, out int expirationUnixTime);
                     var unixTimestamp = (int)DateTime.UtcNow.Subtract(new DateTime(1970, 1, 1)).TotalSeconds;
                     if (unixTimestamp < expirationUnixTime)
                     {
@@ -108,13 +116,13 @@ namespace WindowsFormsApp1.Models
                         var unixTimestamp = (int)DateTime.UtcNow.Subtract(new DateTime(1970, 1, 1)).TotalSeconds;
                         // cộng thêm 12 tiếng để lấy thời gian hết hạn
                         var expirationUnixTime = unixTimestamp + 12 * 60 * 60;
-                        string tokenPath = Path.Combine(Application.StartupPath, $"{_taxcode}_Token_{expirationUnixTime}.txt");
-                        File.WriteAllText(Application.StartupPath + $"\\{_taxcode}_Token_{expirationUnixTime}.txt", loginResponse.Token);
+                        File.WriteAllText(FileUtil.TOKEN_PATH + $"\\{_taxcode}_Token_{expirationUnixTime}.txt", loginResponse.Token);
                     }
                 }
             }
             catch (Exception ex)
             {
+                LogUtil.LogError(ex);
                 throw ex;
             }
         }
@@ -198,6 +206,7 @@ namespace WindowsFormsApp1.Models
             }
             catch (Exception ex)
             {
+                LogUtil.LogError(ex);
                 throw ex;
             }
         }
@@ -220,368 +229,312 @@ namespace WindowsFormsApp1.Models
             return captcha;
         }
 
-        public string BuildQueryParam(string url, Dictionary<string, string> queryParams)
-        {
-            string queryString = string.Join("&", queryParams.Select(kvp => $"{kvp.Key}={kvp.Value}"));
-            return url + "?" + queryString;
-        }
-
+        #region Đồng bộ từ cơ quan thuế
         /// <summary>
         /// Lấy chi tiết hóa đơn
         /// </summary>
         /// <param name="requests"></param>
         /// <param name="progressBarManager"></param>
         /// <returns></returns>
-        public async Task<List<HoaDon>> GetInvoiceInfoDetailAsyc(List<InvoicesResponse> requests, string linkGetDetail)
+        public async Task<HoaDon> GetInvoiceDetail(Dictionary<string, string> queryParams, string linkGetDetail)
         {
             ResetHeaderContent();
-            List<HoaDon> invoiceDetails = new List<HoaDon>();
-            List<HoaDon> tempInvoiceDetails = new List<HoaDon>();
-            List<HoaDon> invoiceDetailsException = new List<HoaDon>();
-            requests.ForEach(x =>
+            try
             {
-                tempInvoiceDetails.AddRange(x.Datas);
-            });
-
-            for (int i = 0; i < tempInvoiceDetails.Count(); i++)
+                LogUtil.LogInfo($"GetInvoiceDetail_{JsonConvert.SerializeObject(queryParams)} has no xml. Get details");
+                // build param
+                string queryString = string.Join("&", queryParams.Select(kvp => $"{kvp.Key}={kvp.Value}"));
+                string urlWithParams = linkGetDetail + "?" + queryString;
+                var response = await CommonPattern.RetryOperationAsync(async () =>
+                {
+                    var httpResponse = await _client.GetAsync(urlWithParams);
+                    httpResponse.EnsureSuccessStatusCode();
+                    return httpResponse;
+                });
+                string stringContent = await response.Content.ReadAsStringAsync();
+                LogUtil.LogInfo($"GetInvoiceDetail_{JsonConvert.SerializeObject(queryParams)} get detail success");
+                return JsonConvert.DeserializeObject<HoaDon>(stringContent);
+            }
+            catch (Exception ex)
             {
-                var queryParams = new Dictionary<string, string> {
-                    { "nbmst", tempInvoiceDetails[i].MSTNBan },
-                    { "khhdon", tempInvoiceDetails[i].KyHieuHDon },
-                    { "shdon", tempInvoiceDetails[i].SoHDon },
-                    { "khmshdon", tempInvoiceDetails[i].KyHieuMSoHDon.ToString()}
-                };
+                LogUtil.LogError(ex);
+                throw ex;
+            }
+        }
 
-                try
+        /// <summary>
+        /// Lấy hóa đơn theo khoảng thời gian
+        /// </summary>
+        /// <param name="baseUrl"></param>
+        /// <param name="request"></param>
+        /// <param name="currentDate"></param>
+        /// <param name="endDate"></param>
+        /// <returns></returns>
+        private async Task<List<InvoicesResponse>> FetchInvoiceList(string baseUrl, InvoiceInfoRequest request, DateTime currentDate, DateTime endDate)
+        {
+            ResetHeaderContent();
+            _client.Timeout = TimeSpan.FromMilliseconds(2000);
+            List<InvoicesResponse> invoicesInRange = new List<InvoicesResponse>();
+
+            // Tạo biểu thức tìm kiếm cho ngày hiện tại
+            var textSearch = $"tdlap=ge={currentDate:dd/MM/yyyyT00:00:00};tdlap=le={endDate:dd/MM/yyyyT23:59:59}";
+
+            // Trạng thái hóa đơn
+            if (request.InvoiceStatus != 0)
+            {
+                textSearch += $";tthai=={request.InvoiceStatus}";
+            }
+
+            // Kết quả kiểm tra hóa đơn
+            if (request.InvoiceCheckResult != -1)
+            {
+                // nếu khác tất cả
+                textSearch += $";ttxly=={request.InvoiceCheckResult}";
+            }
+            else
+            {
+                // Nếu khác tất cả và là hóa đơn mua vào thì lấy cả 3 trạng thái
+                // 5: "Đã cấp mã hóa đơn",
+                // 6: "Tổng cục thuế đã nhận không mã",
+                // 8: "Tổng cục thuế đã nhận hóa đơn có mã khởi tạo từ máy tính tiền"
+                if (request.EinvoiceTab == 1)
                 {
-                    // build param
-                    string queryString = string.Join("&", queryParams.Select(kvp => $"{kvp.Key}={kvp.Value}"));
-                    string urlWithParams = linkGetDetail + "?" + queryString;
-                    var response = await CommonPattern.RetryOperationAsync(async () =>
-                    {
-                        //return await _client.GetAsync(urlWithParams);
-                        var httpResponse = await _client.GetAsync(urlWithParams);
-                        if (!httpResponse.IsSuccessStatusCode)
-                        {
-                            Logger.Log($"Failed - {JsonConvert.SerializeObject(queryParams)}");
-                            throw new Exception($"HTTP request failed with status code {httpResponse.StatusCode}");
-                        }
-                        return httpResponse;
-                    });
-                    response.EnsureSuccessStatusCode();
-                    string stringContent = await response.Content.ReadAsStringAsync();
-                    invoiceDetails.Add(JsonConvert.DeserializeObject<HoaDon>(stringContent));
-                    Logger.Log($"Success - {JsonConvert.SerializeObject(queryParams)}");
-                }
-                catch (Exception ex)
-                {
-                    Logger.Log($"Failed - {JsonConvert.SerializeObject(queryParams)} - {ex.Message}");
+                    textSearch += $";ttxly=in=(5,6,8)";
                 }
             }
 
-            return invoiceDetails;
+            if (request.IsPaymentOrder && (baseUrl == DownloadEinvoiceSetting.LinkSoldInvoices || baseUrl == DownloadEinvoiceSetting.LinkPurchaseInvoices))
+            {
+                textSearch += $";unhiem==1";
+            }
+
+            var queryParams = new Dictionary<string, string>
+            {
+                { "sort", "tdlap:desc,khmshdon:asc,shdon:desc" },
+                { "size", $"{request.Take}" },
+                { "search", textSearch }
+            };
+
+            // Build parameter
+            string urlWithParams = BuildQueryParam(baseUrl, queryParams);
+
+            // check xem có trang tiếp theo hay không
+            bool hasNextState = true;
+            // state của kết quả trả về hiện tại là param của trang sau
+            string currentState = null;
+            int totalPages = 0;
+            int currentPage = 0;
+
+            while (hasNextState)
+            {
+                try
+                {
+                    // build lại param lấy trang tiếp theo dựa trên state
+                    if (!string.IsNullOrEmpty(currentState))
+                    {
+                        queryParams["state"] = currentState;
+                        urlWithParams = BuildQueryParam(baseUrl, queryParams);
+                    }
+                    string stringContent = "";
+                    var response = await CommonPattern.RetryOperationAsync(async () =>
+                    {
+                        var httpResponse = await _client.GetAsync(urlWithParams);
+                        stringContent = await httpResponse.Content.ReadAsStringAsync();
+                        if (!httpResponse.IsSuccessStatusCode)
+                        {
+                            throw new Exception($"{urlWithParams} has error {stringContent}");
+                        }
+                        httpResponse.EnsureSuccessStatusCode();
+                        return httpResponse;
+                    });
+                    var invoiceResponse = JsonConvert.DeserializeObject<InvoicesResponse>(stringContent);
+                    if (totalPages == 0)
+                    {
+                        totalPages = (int)Math.Ceiling((double)invoiceResponse.Total / request.Take);
+                    }
+                    currentState = invoiceResponse.State;
+                    // Thêm hóa đơn vào danh sách
+                    invoicesInRange.Add(invoiceResponse);
+
+                    hasNextState = !string.IsNullOrEmpty(currentState) && request.Take != 1;
+                    currentPage++;
+
+                    LogUtil.LogInfo($"FetchInvoiceList {currentPage}/ {totalPages} Page - TotalCrawl: {invoicesInRange.Sum(x => x.Datas.Count())}/ Total: {invoiceResponse.Total}");
+                    if (currentPage % 10 == 0)
+                    {
+                        await Task.Delay(300);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    hasNextState = false;
+                    LogUtil.LogError(ex);
+                    throw ex;
+                }
+            }
+            return invoicesInRange;
         }
 
-        //private async Task<List<InvoicesResponse>> FetchInvoiceListAsync(string baseUrl, InvoiceInfoRequest request, DateTime currentDate, DateTime? endDate = null)
-        //{
-        //    ResetHeaderContent();
-        //    List<InvoicesResponse> invoicesInRange = new List<InvoicesResponse>();
-
-        //    // Tạo biểu thức tìm kiếm cho ngày hiện tại
-        //    var textSearch = $"tdlap=ge={currentDate:dd/MM/yyyyT00:00:00};tdlap=le={currentDate:dd/MM/yyyyT23:59:59}";
-
-        //    // nếu có endDate thì build lại query
-        //    // (mục đích chính là test case nếu có hóa đơn khởi tạo từ máy tính tiền thì kiểm tra xem có không)
-        //    if (endDate != null)
-        //    {
-        //        textSearch = $"tdlap=ge={currentDate:dd/MM/yyyyT00:00:00};tdlap=le={endDate:dd/MM/yyyyT23:59:59}";
-        //    }
-
-        //    // Trạng thái hóa đơn
-        //    if (request.InvoiceStatus != 0)
-        //    {
-        //        textSearch += $";tthai=={request.InvoiceStatus}";
-        //    }
-
-        //    // Kết quả kiểm tra hóa đơn
-        //    if (request.InvoiceCheckResult != -1)
-        //    {
-        //        // nếu khác tất cả
-        //        textSearch += $";ttxly=={request.InvoiceCheckResult}";
-        //    }
-        //    else
-        //    {
-        //        // Nếu khác tất cả và là hóa đơn mua vào thì lấy cả 3 trạng thái
-        //        // 5: "Đã cấp mã hóa đơn",
-        //        // 6: "Tổng cục thuế đã nhận không mã",
-        //        // 8: "Tổng cục thuế đã nhận hóa đơn có mã khởi tạo từ máy tính tiền"
-        //        if (request.EinvoiceTab == 1)
-        //        {
-        //            textSearch += $";ttxly=in=(5,6,8)";
-        //        }
-        //    }
-
-        //    if (request.Unhiem && (baseUrl == DownloadEinvoiceSetting.LinkSoldInvoices || baseUrl == DownloadEinvoiceSetting.LinkPurchaseInvoices))
-        //    {
-        //        textSearch += $";unhiem==1";
-        //    }
-
-        //    var queryParams = new Dictionary<string, string>
-        //    {
-        //        { "sort", "tdlap:desc,khmshdon:asc,shdon:desc" },
-        //        { "size", $"{request.Take}" },
-        //        { "search", textSearch }
-        //    };
-
-        //    // Build parameter
-        //    string urlWithParams = BuildQueryParam(baseUrl, queryParams);
-
-        //    // check xem có trang tiếp theo hay không
-        //    bool hasNextState = true;
-        //    // state của kết quả trả về hiện tại là param của trang sau
-        //    string currentState = null;
-
-        //    while (hasNextState)
-        //    {
-        //        // build lại param lấy trang tiếp theo dựa trên state
-        //        if (!string.IsNullOrEmpty(currentState))
-        //        {
-        //            queryParams["state"] = currentState;
-        //            urlWithParams = BuildQueryParam(baseUrl, queryParams);
-        //        }
-
-        //        try
-        //        {
-        //            var stringContent = "";
-        //            var response = CommonPattern.RetryOperationAsync(async () =>
-        //            {
-        //                var httpResponse = await _client.GetAsync(urlWithParams);
-        //                stringContent = await httpResponse.Content.ReadAsStringAsync();
-        //                httpResponse.EnsureSuccessStatusCode();
-        //                if (!httpResponse.IsSuccessStatusCode)
-        //                {
-        //                    throw new Exception($"FetchInvoiceListAsync_Request failed with status code {httpResponse.StatusCode} - Message: {stringContent} - {JsonConvert.SerializeObject(queryParams)}");
-        //                }
-        //                return httpResponse;
-        //            });
-
-        //            var invoiceResponse = JsonConvert.DeserializeObject<InvoicesResponse>(stringContent);
-        //            currentState = invoiceResponse.State;
-
-        //            // Thêm hóa đơn vào danh sách
-        //            invoicesInRange.Add(invoiceResponse);
-
-        //            hasNextState = !string.IsNullOrEmpty(currentState);
-        //        }
-        //        catch (Exception ex)
-        //        {
-        //            hasNextState = false;
-        //            Logger.Log(ex.Message);
-        //            throw ex;
-        //        }
-        //    }
-
-        //    return invoicesInRange;
-        //}
-
-        ///// <summary>
-        ///// Tải XML
-        ///// </summary>
-        ///// <param name="requests"></param>
-        ///// <param name="progressBarManager"></param>
-        ///// <returns></returns>
-        //public async Task<bool> DownloadXmlAsync(Dictionary<DateTime, List<HoaDon>> requests)
-        //{
-        //    List<byte[]> downloadXMLResults = new List<byte[]>();
-        //    foreach (var date in requests)
-        //    {
-        //        int totalSuccess = 0;
-        //        int totalError = 0;
-        //        for (int i = 0; i < date.Value.Count(); i++)
-        //        {
-        //            try
-        //            {
-        //                var queryParams = new Dictionary<string, string> {
-        //                    { "nbmst", date.Value[i].MSTNBan }, // MSTNBan
-        //                    { "khhdon", date.Value[i].KyHieuHDon }, // Series
-        //                    { "shdon", date.Value[i].SoHDon }, // InvoiceNo
-        //                    { "khmshdon", date.Value[i].KyHieuMSoHDon.ToString() } // TemplateNo
-        //                };
-
-        //                // check xem nếu trong ký hiệu hóa đơn ký tự thứ 3 là M thì là link khởi tạo từ máy tính tiền
-        //                var linkExportXml = date.Value[i].KyHieuHDon.IndexOf("M") == 3 ? DownloadEinvoiceSetting.LinkExportXmlFromCashRegister : DownloadEinvoiceSetting.LinkExportXml;
-
-        //                // build query param
-        //                string queryString = string.Join("&", queryParams.Select(kvp => $"{kvp.Key}={kvp.Value}"));
-        //                string urlWithParams = linkExportXml + "?" + queryString;
-
-        //                // tải xml, nếu sau 3 lần tải thất bại sẽ trả về exception do lỗi
-        //                var response = await CommonPattern.RetryOperationAsync(async () =>
-        //                {
-        //                    // reset lại header mới cho mỗi lần tải
-        //                    ResetHeaderContent();
-        //                    _client.Timeout = TimeSpan.FromSeconds(2); // thời gian timeout tối đa là 2s
-
-        //                    var httpResponse = await _client.GetAsync(urlWithParams);
-        //                    if (!httpResponse.IsSuccessStatusCode)
-        //                    {
-        //                        string errorContent = httpResponse.Content.ReadAsStringAsync().Result;
-        //                        if (!string.IsNullOrEmpty(errorContent))
-        //                        {
-        //                            var errorMessage = JsonConvert.DeserializeObject<BaseTaxaxionResponse>(errorContent);
-        //                            if (!string.IsNullOrEmpty(errorMessage.Message))
-        //                            {
-        //                                totalError++;
-        //                                // break retry luôn nếu không tìm thấy thông tin hóa đơn
-        //                                throw new DownloadXMLException($"DownloadXmlAsync_Response from HDDT : {errorMessage.Message} - {JsonConvert.SerializeObject(queryParams)}");
-        //                            }
-        //                        }
-        //                        throw new Exception($"DownloadXmlAsync_Request failed with status code {httpResponse.StatusCode} - {JsonConvert.SerializeObject(queryParams)}");
-        //                    }
-        //                    return httpResponse;
-        //                });
-
-        //                new Task(async () =>
-        //                {
-        //                    // nếu response thành công thì sẽ đọc xml trong zip
-        //                    byte[] responseBodyBytes = response.Content.ReadAsByteArrayAsync().Result;
-        //                    await ExtractAndSendXmlAsync(responseBodyBytes, date.Value[i]);
-        //                }).Start();
-
-        //                totalSuccess++;
-
-        //                // TODO: Gửi hóa đơn sang inbot
-        //                // tải 10 cái delay 0.5s
-        //                if ((i + 1) % 5 == 0)
-        //                {
-        //                    Task.Delay(500).Wait();
-        //                }
-        //            }
-        //            catch (Exception ex)
-        //            {
-        //                totalError++;
-        //                Logger.Log($"DownloadXmlAsync_{ex.Message}");
-        //            }
-        //        }
-
-        //        Logger.Log($"Hoàn thành tải thành công {totalSuccess}/{date.Value.Count()} - Thất bại: {totalError}");
-        //    }
-
-        //    return true;
-        //}
-        ///// <summary>
-        ///// Giải nén folder và tìm ra file xml để gửi sang inbot
-        ///// </summary>
-        ///// <param name="zipData"></param>
-        ///// <param name="request"></param>
-        ///// <returns></returns>
-        //private async Task<bool> ExtractAndSendXmlAsync(byte[] zipData, HoaDon request)
-        //{
-        //    try
-        //    {
-        //        using (var zipStream = new MemoryStream(zipData))
-        //        using (var archive = new ZipArchive(zipStream, ZipArchiveMode.Read))
-        //        {
-        //            // save xml and html
-        //            foreach (var entry in archive.Entries)
-        //            {
-        //                var extension = Path.GetExtension(entry.Name);
-        //                var fileName = Path.GetFileName(entry.Name);
-        //                // lưu cả file xml và html
-        //                if (extension == ".html" || extension == ".xml")
-        //                {
-        //                    using (var xmlStream = entry.Open())
-        //                    using (var xmlMemoryStream = new MemoryStream())
-        //                    {
-        //                        await xmlStream.CopyToAsync(xmlMemoryStream);
-        //                        byte[] xmlBytes = xmlMemoryStream.ToArray();
-
-        //                        // test lưu xem tải về đủ chưa
-        //                        string folderPath = $"xml/{request.MSTNBan}";
-        //                        if (!Directory.Exists(folderPath))
-        //                        {
-        //                            Directory.CreateDirectory(folderPath);
-        //                        }
-        //                        string folderName = $"{folderPath}/{request.KyHieuMSoHDon}_{request.KyHieuHDon}_{request.SoHDon}_{fileName}";
-        //                        File.WriteAllBytes(folderName, xmlBytes);
-        //                        Logger.Log($"Download {folderName} success");
-        //                    }
-        //                }
-        //            }
-        //        }
-        //    }
-        //    catch (Exception ex)
-        //    {
-        //        Logger.Log(ex.Message);
-        //        throw ex;
-        //    }
-        //    return true;
-        //}
-
-        public async Task<string> ViewDetailHTML(TaxaxionRequest request)
+        /// <summary>
+        /// Build query param từ dictionary và base url
+        /// </summary>
+        /// <param name="url"></param>
+        /// <param name="queryParams"></param>
+        /// <returns></returns>
+        private string BuildQueryParam(string url, Dictionary<string, string> queryParams)
         {
-            var queryParams = new Dictionary<string, string> {
-                            { "nbmst", request.MSTNBan }, // MSTNBan
-                            { "khhdon", request.Series }, // Series
-                            { "shdon", request.InvoiceNo }, // InvoiceNo
-                            { "khmshdon", request.TemplateNo.ToString() } // TemplateNo
+            string queryString = string.Join("&", queryParams.Select(kvp => $"{kvp.Key}={kvp.Value}"));
+            return url + "?" + queryString;
+        }
+
+        /// <summary>
+        /// Tải XML
+        /// </summary>
+        /// <param name="requests"></param>
+        /// <param name="progressBarManager"></param>
+        /// <returns></returns>
+        public async Task<List<DownloadXMLResult>> DownloadXmlAsync(List<InvoiceBotResponse> invoices, RequestSyncTaxAuthority syncRequest)
+        {
+            // tạo folder lưu file xml, pdf phục vụ sau này
+            string folderPath = $"{Application.StartupPath}/HDDT/{_username}/Invoices";
+            if (!Directory.Exists(folderPath))
+            {
+                Directory.CreateDirectory(folderPath);
+            }
+
+            var httpClient = new HttpClient();
+            httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", syncRequest.Authorization);
+            httpClient.DefaultRequestHeaders.Add("X-Misa-Context", syncRequest.XMISAContext);
+
+            // số lượng tải thành công
+            int totalSuccess = 0;
+            // số lượng tải thất bại
+            int totalError = 0;
+
+            // Create a list to store the tasks for downloading XML files
+            var xmlResults = new List<DownloadXMLResult>();
+
+            for (int i = 0; i < invoices.Count; i++)
+            {
+                try
+                {
+                    var invoice = invoices[i];
+
+                    var queryParams = new Dictionary<string, string> {
+                            { "nbmst", invoice.SellerTaxCode }, // MSTNBan
+                            { "khhdon", invoice.Series }, // Series
+                            { "shdon", invoice.InvoiceNo }, // InvoiceNo
+                            { "khmshdon", invoice.TemplateNo } // TemplateNo
                         };
 
-            // check xem nếu trong ký hiệu hóa đơn ký tự thứ 3 là M thì là link khởi tạo từ máy tính tiền
-            var linkExportXml = request.Series.IndexOf("M") == 3 ? DownloadEinvoiceSetting.LinkExportXmlFromCashRegister : DownloadEinvoiceSetting.LinkExportXml;
+                    // check xem nếu trong ký hiệu hóa đơn ký tự thứ 3 là M thì thay đổi link tải
+                    var linkExportXml = invoice.Series.IndexOf("M") == 3 ? DownloadEinvoiceSetting.LinkExportXmlFromCashRegister : DownloadEinvoiceSetting.LinkExportXml;
 
-            // build query param
-            string queryString = string.Join("&", queryParams.Select(kvp => $"{kvp.Key}={kvp.Value}"));
-            string urlWithParams = linkExportXml + "?" + queryString;
+                    // build query param
+                    string urlWithParams = BuildQueryParam(linkExportXml, queryParams);
 
-            // tải xml, nếu sau 3 lần tải thất bại sẽ trả về exception do lỗi
-            var response = await CommonPattern.RetryOperationAsync(async () =>
-            {
-                // reset lại header mới cho mỗi lần tải
-                ResetHeaderContent();
-                _client.Timeout = TimeSpan.FromSeconds(2); // thời gian timeout tối đa là 2s
-
-                var httpResponse = await _client.GetAsync(urlWithParams);
-                if (!httpResponse.IsSuccessStatusCode)
-                {
-                    string errorContent = await httpResponse.Content.ReadAsStringAsync();
-                    if (!string.IsNullOrEmpty(errorContent))
+                    bool hasXML = false;
+                    // tải xml, nếu sau 10 lần tải thất bại sẽ trả về exception do lỗi
+                    // trả về task là string
+                    var response = await CommonPattern.RetryOperationAsync(async () =>
                     {
-                        var errorMessage = JsonConvert.DeserializeObject<BaseTaxaxionResponse>(errorContent);
-                        if (!string.IsNullOrEmpty(errorMessage.Message))
-                        {
-                            // break retry luôn nếu không tìm thấy thông tin hóa đơn
-                            throw new DownloadXMLException($"DownloadXmlAsync_Response from HDDT : {errorMessage.Message} - {JsonConvert.SerializeObject(queryParams)}");
-                        }
-                    }
-                    throw new Exception($"DownloadXmlAsync_Request failed with status code {httpResponse.StatusCode} - {JsonConvert.SerializeObject(queryParams)}");
-                }
-                return httpResponse;
-            });
+                        ResetHeaderContent();
+                        // thời gian tải xml timeout tối đa là 1.5s
+                        _client.Timeout = TimeSpan.FromSeconds(1.5);
+                        var httpResponse = await _client.GetAsync(urlWithParams);
 
-            byte[] responseBodyBytes = response.Content.ReadAsByteArrayAsync().Result;
-            return ReadHtmlFromZip(responseBodyBytes);
+                        if (!httpResponse.IsSuccessStatusCode)
+                        {
+                            string errorContent = await httpResponse.Content.ReadAsStringAsync();
+                            var errorMessage = JsonConvert.DeserializeObject<BaseTaxaxionResponse>(errorContent);
+                            if (!string.IsNullOrEmpty(errorMessage.Message))
+                            {
+                                if (errorMessage.Message.ToLower().Contains("không tồn tại hồ sơ gốc của hóa đơn"))
+                                {
+                                    return null;
+                                }
+                            }
+                            throw new Exception($"DownloadXmlAsync_Request failed {JsonConvert.SerializeObject(httpResponse)}");
+                        }
+                        httpResponse.EnsureSuccessStatusCode();
+                        hasXML = true;
+                        return httpResponse;
+                    });
+
+                    string xmlContent = "";
+                    InvoiceBotResponse invoiceBotDetail = null;
+                    if (hasXML && response != null)
+                    {
+                        byte[] responseBodyBytes = await response.Content.ReadAsByteArrayAsync();
+                        xmlContent = ExtractToXml(responseBodyBytes, invoice, folderPath, httpClient, syncRequest);
+                    }
+                    else
+                    {
+                        var linkGetInvoiceDetail = invoice.Series.IndexOf("M") == 3 ? DownloadEinvoiceSetting.LinkGetDetailFromCashRegister : DownloadEinvoiceSetting.LinkGetDetail;
+                        var invoiceDetail = await GetInvoiceDetail(queryParams, linkGetInvoiceDetail);
+                        invoiceBotDetail = MappingTaxaxionToInbot(new List<HoaDon> { invoiceDetail }, syncRequest).FirstOrDefault();
+                    }
+
+                    xmlResults.Add(new DownloadXMLResult
+                    {
+                        InvoiceId = invoice.InvoiceId,
+                        XMLContent = xmlContent,
+                        DetailContent = invoiceBotDetail
+                    });
+
+                    totalSuccess++;
+
+                    LogUtil.LogInfo($"DownloadXmlAsync_{urlWithParams} - success");
+                    // tải 5 cái delay 0.5s
+                    // sau vài chục lần chạy cấu hình thì thấy config như vậy là hợp lý để không bị thuế chặn
+                    if ((i + 1) % 5 == 0)
+                    {
+                        await Task.Delay(300);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    totalError++;
+                    LogUtil.LogError(ex);
+                }
+            }
+            LogUtil.LogInfo($"DownloadXmlAsync_Finish to download xml: {totalSuccess}/{invoices.Count()} - Failed: {totalError}");
+            return xmlResults.ToList();
         }
 
-        private string ReadHtmlFromZip(byte[] zipData)
+        /// <summary>
+        /// Giải nén folder và tìm ra file xml để gửi sang kế toán
+        /// </summary>
+        /// <param name="zipData"></param>
+        /// <param name="request"></param>
+        /// <returns></returns>
+        private string ExtractToXml(byte[] zipData, InvoiceBotResponse request, string folderPath, HttpClient httpClient, RequestSyncTaxAuthority syncRequest)
         {
             try
             {
-                using (MemoryStream zipStream = new MemoryStream(zipData))
-                using (ZipArchive archive = new ZipArchive(zipStream, ZipArchiveMode.Read))
+                using (var zipStream = new MemoryStream(zipData))
+                using (var archive = new ZipArchive(zipStream, ZipArchiveMode.Read))
                 {
-                    foreach (ZipArchiveEntry entry in archive.Entries)
+                    // Duyệt qua các file trong file zip để tìm html và xml
+                    foreach (var entry in archive.Entries)
                     {
-                        if (entry.FullName.EndsWith(".html", StringComparison.OrdinalIgnoreCase))
+                        // lấy ra extention
+                        var extension = Path.GetExtension(entry.Name);
+                        // lấy ra tên file
+                        var fileName = Path.GetFileName(entry.Name);
+                        var tmpXmlFolder = $"{folderPath}/{request.InvoiceDate:dd-MM-yyyy}";
+                        if (!Directory.Exists(tmpXmlFolder))
                         {
-                            // Tìm thấy tệp HTML trong ZIP, đọc nội dung của nó
-                            using (Stream htmlStream = entry.Open())
-                            using (StreamReader reader = new StreamReader(htmlStream))
+                            Directory.CreateDirectory(tmpXmlFolder);
+                        }
+                        string filePath = $"{tmpXmlFolder}/{request.TemplateNo}_{request.Series}_{request.InvoiceNo}_{fileName}";
+                        if (extension.ToLower() == ".xml")
+                        {
+                            using (var fileStream = entry.Open())
+                            using (var reader = new StreamReader(fileStream, Encoding.UTF8))
                             {
-                                string htmlContent = reader.ReadToEnd();
-                                // Ở đây bạn có thể xử lý nội dung HTML theo ý muốn
-                                // Ví dụ: hiển thị nó trên một TextBox
-                                return htmlContent;
+                                string xmlContent = reader.ReadToEnd();
+                                return xmlContent;
                             }
                         }
                     }
@@ -589,137 +542,111 @@ namespace WindowsFormsApp1.Models
             }
             catch (Exception ex)
             {
-                MessageBox.Show("Lỗi khi đọc ZIP: " + ex.Message);
+                LogUtil.LogError(ex);
+                throw ex;
             }
             return "";
         }
 
         /// <summary>
-        /// Đồng bộ hóa đơn trong khoảng thời gian
+        /// Đồng bộ danh sách hóa đơn từ CQT
         /// </summary>
-        /// <param name="request"></param>
-        /// <param name="progressBarManager"></param>
+        /// <param name="message"></param>
         /// <returns></returns>
-        //public Dictionary<DateTime, List<HoaDon>> GetInvoicesInRange(InvoiceInfoRequest request, ProgressBarManager progressBarManager)
-        //{
-        //    ResetHeaderContent();
+        public async Task<List<HoaDon>> SyncInvoiceInRange(RequestSyncTaxAuthority syncRequest)
+        {
+            try
+            {
+                LogUtil.LogInfo($"SyncInvoiceInRange_Start");
 
-        //    string linkInvoice = $"{DownloadEinvoiceSetting.LinkPurchaseInvoices}";
-        //    string linkInvoiceFromCashRegister = $"{DownloadEinvoiceSetting.LinkPurchaseInvoicesFromCashRegister}";
+                // Xử lý đăng nhập và lấy token
+                // trong hàm này đã retry rồi nên thôi bỏ qua bước retry
+                // đã xử lý exception sai captcha, sai mật khẩu.
+                await CheckToken();
 
-        //    if (request.EinvoiceTab == 0)
-        //    {
-        //        linkInvoice = $"{DownloadEinvoiceSetting.LinkSoldInvoices}";
-        //        linkInvoiceFromCashRegister = $"{DownloadEinvoiceSetting.LinkSoldInvoicesFromCashRegister}";
-        //    }
+                ResetHeaderContent();
 
-        //    // tổng danh sách hóa đơn sau khi thành công theo ngày
-        //    var invoicesInRange = new Dictionary<DateTime, List<HoaDon>>();
+                // tham số để lấy hóa đơn
+                InvoiceInfoRequest request = new InvoiceInfoRequest()
+                {
+                    StartDate = syncRequest.StartDate,
+                    EndDate = syncRequest.EndDate,
+                    EinvoiceTab = syncRequest.IsSyncFromInputInvoice ? 1 : 0,
+                    IsPaymentOrder = syncRequest.IsPaymentOrder
+                };
 
-        //    List<InvoicesResponse> invoices = null;
-        //    List<InvoicesResponse> invoicesFromCashRegister = null;
+                LogUtil.LogInfo($"SyncInvoiceInRange_Request param {JsonConvert.SerializeObject(request)}");
 
-        //    int completed = 0;
-        //    int total = request.EndDate.Date.Subtract(request.StartDate.Date).Days + 1;
-        //    bool hasInvoiceFromCashRegister = false;
+                string linkInvoice = $"{DownloadEinvoiceSetting.LinkPurchaseInvoices}";
+                string linkInvoiceFromCashRegister = $"{DownloadEinvoiceSetting.LinkPurchaseInvoicesFromCashRegister}";
 
-        //    DateTime currentDate = request.StartDate.Date;
-        //    DateTime endDate = request.EndDate.Date;
+                // nếu là hóa đơn bán ra thì sửa lại link lấy trên danh sách
+                if (request.EinvoiceTab == 0)
+                {
+                    linkInvoice = $"{DownloadEinvoiceSetting.LinkSoldInvoices}";
+                    linkInvoiceFromCashRegister = $"{DownloadEinvoiceSetting.LinkSoldInvoicesFromCashRegister}";
+                }
 
-        //    // KH ít sử dụng hóa đơn từ máy tính tiền nên take 1 để check xem có total bao nhiêu hóa đơn
-        //    // nếu không có thì thôi đỡ tốn gọi 2 api bên dưới
-        //    invoicesFromCashRegister = CommonPattern.RetryOperation(() =>
-        //    {
-        //        request.Take = 1;
-        //        return FetchInvoiceListAsync(linkInvoiceFromCashRegister, request, currentDate, endDate);
-        //    });
+                // Tổng số hóa đơn lấy về trong khoảng thời gian
+                var invoicesInRange = new List<HoaDon>();
 
-        //    if (invoicesFromCashRegister != null && invoicesFromCashRegister.Count > 0 && invoicesFromCashRegister.FirstOrDefault().Total > 0)
-        //    {
-        //        hasInvoiceFromCashRegister = true;
-        //    }
+                // hóa đơn thường
+                List<InvoicesResponse> invoices = new List<InvoicesResponse>();
+                // hóa đơn khởi tạo từ máy tính tiền
+                List<InvoicesResponse> invoicesFromCashRegister = new List<InvoicesResponse>();
 
-        //    request.Take = 50;
-        //    while (currentDate <= request.EndDate.Date)
-        //    {
-        //        try
-        //        {
-        //            var lstXMLDownload = new List<HoaDon>();
-
-        //            // Lấy Hóa đơn điện tử
-        //            invoices = CommonPattern.RetryOperation(() =>
-        //            {
-        //                return FetchInvoiceListAsync(linkInvoice, request, currentDate);
-        //            });
-
-        //            if (invoices != null && invoices.Count > 0)
-        //            {
-        //                invoices.ForEach(x =>
-        //                {
-        //                    lstXMLDownload.AddRange(x.Datas);
-        //                });
-        //            }
-
-        //            // Lấy Hóa đơn có mã khởi tạo từ máy tính tiền
-        //            if (!request.Unhiem && hasInvoiceFromCashRegister)
-        //            {
-        //                invoicesFromCashRegister = CommonPattern.RetryOperation(() =>
-        //                {
-        //                    return FetchInvoiceListAsync(linkInvoiceFromCashRegister, request, currentDate);
-        //                });
-
-        //                if (invoicesFromCashRegister != null && invoicesFromCashRegister.Count > 0)
-        //                {
-        //                    invoicesFromCashRegister.ForEach(x =>
-        //                    {
-        //                        lstXMLDownload.AddRange(x.Datas);
-        //                    });
-        //                }
-        //            }
-
-        //            var invoiceBotMapping = MappingTaxaxionToInbot(lstXMLDownload);
-        //            var subId = "asp-c7f68009dd07ab2b8b6db026";
-        //            var orgId = "639ac3a8416ebb5fcdd23332";
-        //            var taxAuthorityResponse = new TaxAuthoritySyncMaster
-        //            {
-        //                TotalCrawl = invoiceBotMapping.Count,
-        //                TotalResponse = invoices.FirstOrDefault().Total.Value + invoicesFromCashRegister.FirstOrDefault().Total.Value,
-        //                DateConnect = currentDate,
-        //                SubscriberId = subId,
-        //                OrganizationId = orgId,
-        //                Id = BuildSyncHistoryMasterId(subId, orgId, currentDate),
-        //                Invoices = invoiceBotMapping
-        //            };
-
-        //            // TODO: Call về Kế toán Lưu vào bảng inb_bot_list và 
-        //            Logger.Log($"Hoàn thành lấy danh sách hóa đơn ngày {currentDate} - Total: {lstXMLDownload.Count} - Total In HDDT: {invoices.FirstOrDefault().Total.Value + invoicesFromCashRegister.FirstOrDefault().Total.Value}");
-
-        //            invoicesInRange.Add(currentDate, lstXMLDownload);
-
-        //            //// DOWNLOAD XML bất đồng bộ
-        //            //var invoiceListDownload = new Dictionary<DateTime, List<HoaDon>>
-        //            //{
-        //            //    { currentDate, lstXMLDownload }
-        //            //};
-
-        //            //if (invoiceListDownload.Count > 0)
-        //            //{
-        //            //    DownloadXml(invoiceListDownload);
-        //            //}
-        //        }
-        //        finally
-        //        {
-        //            completed++;
-        //            progressBarManager.UpdateProgress(completed, total);
-        //            // Di chuyển đến ngày tiếp theo
-        //            currentDate = currentDate.AddDays(1);
-        //        }
-        //    }
+                DateTime currentDate = request.StartDate.Date;
+                DateTime endDate = request.EndDate.Date;
 
 
+                var lstXMLDownload = new List<HoaDon>();
 
-        //    return invoicesInRange;
-        //}
+                // Lấy Hóa đơn điện tử
+                invoices = await FetchInvoiceList(linkInvoice, request, currentDate, endDate);
+
+                if (invoices != null && invoices.Count > 0)
+                {
+                    invoices.ForEach(x =>
+                    {
+                        lstXMLDownload.AddRange(x.Datas);
+                    });
+                }
+
+                // Nếu không phải hóa đơn ủy nhiệm và có hóa đơn khởi tạo từ máy tính tiền
+                if (!request.IsPaymentOrder)
+                {
+                    invoicesFromCashRegister = await FetchInvoiceList(linkInvoiceFromCashRegister, request, currentDate, endDate);
+
+                    if (invoicesFromCashRegister != null && invoicesFromCashRegister.Count > 0)
+                    {
+                        invoicesFromCashRegister.ForEach(x =>
+                        {
+                            lstXMLDownload.AddRange(x.Datas);
+                        });
+                    }
+                }
+
+                // mapping list inv crwal được sang bên inbot
+                var invoiceBotMapping = MappingTaxaxionToInbot(lstXMLDownload, syncRequest);
+                //LogUtil.LogInfo($"MASTER DATA: {JsonConvert.SerializeObject(invoiceBotMapping)}");
+                LogUtil.LogInfo($"CRAWL MASTER SUCCESS {invoiceBotMapping.Count}/{invoices.FirstOrDefault().Total + invoicesFromCashRegister.FirstOrDefault().Total}");
+                if (lstXMLDownload.Count > 0)
+                {
+                    var xmlResults = await DownloadXmlAsync(invoiceBotMapping, syncRequest);
+                    //LogUtil.LogInfo($"DETAIL DATA: {JsonConvert.SerializeObject(xmlResults.ToList())}");
+                    LogUtil.LogInfo($"CRAWL DETAIL SUCCESS {xmlResults.Count}");
+                }
+
+                return lstXMLDownload;
+            }
+            catch (Exception ex)
+            {
+                LogUtil.LogError(ex);
+                throw ex;
+            }
+        }
+        #endregion
+
         /// <summary>
         /// Lấy thông tin hóa đơn khi không kết nối
         /// </summary>
@@ -764,14 +691,15 @@ namespace WindowsFormsApp1.Models
             string queryString = string.Join("&", queryParams.Select(kvp => $"{kvp.Key}={kvp.Value}"));
             string urlWithParams = $"{linkSearch}?{queryString}";
 
-            Logger.Log($"Build xong query cho hóa đơn {request.InvoiceNo} - {urlWithParams}");
-            Logger.Log($"Bắt đầu Gọi API lên thuế Kiểm tra hóa đơn {request.InvoiceNo}");
+            LogUtil.LogInfo($"Build xong query cho hóa đơn {request.InvoiceNo} - {urlWithParams}");
+            LogUtil.LogInfo($"Bắt đầu Gọi API lên thuế Kiểm tra hóa đơn {request.InvoiceNo}");
             HttpResponseMessage response = await _client.GetAsync(urlWithParams);
             response.EnsureSuccessStatusCode();
             string stringContent = await response.Content.ReadAsStringAsync();
-            Logger.Log($"Gọi API lên thuế Kiểm tra hóa đơn {request.InvoiceNo} hoàn tất");
+            LogUtil.LogInfo($"Gọi API lên thuế Kiểm tra hóa đơn {request.InvoiceNo} hoàn tất");
             return JsonConvert.DeserializeObject<HoaDon>(stringContent);
         }
+
         public async Task<List<HoaDon>> GetInvoicesStatusAsync(List<TaxaxionRequest> requests, ProgressBarManager progressBarManager)
         {
             List<HoaDon> invoices = new List<HoaDon>();
@@ -789,9 +717,9 @@ namespace WindowsFormsApp1.Models
 
                     try
                     {
-                        Logger.Log($"Bắt đầu lấy captcha HDDT: {request.InvoiceNo}");
+                        LogUtil.LogInfo($"Bắt đầu lấy captcha HDDT: {request.InvoiceNo}");
                         CaptchaResponse captcha = await GetCaptchaSvgFromWebsiteHDDT();
-                        Logger.Log($"Lấy captcha từ HDDT thành công: {request.InvoiceNo}");
+                        LogUtil.LogInfo($"Lấy captcha từ HDDT thành công: {request.InvoiceNo}");
 
                         request.CaptchaKey = captcha.Key;
                         request.CaptchaText = captcha.Content;
@@ -801,7 +729,7 @@ namespace WindowsFormsApp1.Models
                     }
                     catch (Exception ex)
                     {
-                        Logger.Log($"Lỗi {ex.Message}");
+                        LogUtil.LogInfo($"Lỗi {ex.Message}");
                     }
                     finally
                     {
@@ -814,7 +742,7 @@ namespace WindowsFormsApp1.Models
                             completed++;
                             progressBarManager.UpdateProgress(completed, total);
                         }
-                        Logger.Log($"-----Hoàn thành {request.InvoiceNo} - {completed}");
+                        LogUtil.LogInfo($"-----Hoàn thành {request.InvoiceNo} - {completed}");
                         semaphore.Release(); // Release the slot after processing
                     }
                 }).ToArray();
@@ -824,12 +752,15 @@ namespace WindowsFormsApp1.Models
             }
             catch (Exception ex)
             {
-                Logger.Log($"Lỗi {ex.Message}");
+                LogUtil.LogError(ex);
+                throw ex;
             }
 
             return invoices;
         }
-        public List<InvoiceBotResponse> MappingTaxaxionToInbot(List<HoaDon> invoices, RequestSyncTaxAuthority syncRequest)
+
+        #region Mapping object từ HDDT sang inbot
+        private List<InvoiceBotResponse> MappingTaxaxionToInbot(List<HoaDon> invoices, RequestSyncTaxAuthority syncRequest)
         {
             try
             {
@@ -870,10 +801,11 @@ namespace WindowsFormsApp1.Models
                         ModifiedDate = data.NgayCapNhat.Value,
                         IsRegisterCash = data.KyHieuHDon.IndexOf("M") == 3,
                         SubscriberId = syncRequest.SubscriberId,
-                        OrgId = syncRequest.OrganizationId
+                        OrgId = syncRequest.OrganizationId,
                     };
+
+                    result.TransId = BuildInvoiceId(result.InvoiceNo, result.TemplateNo, result.Series, result.InvoiceDate, result.SellerTaxCode);
                     result.InvoiceId = BuildInvoiceId(result.InvoiceNo, result.TemplateNo, result.Series, result.InvoiceDate, result.SellerTaxCode);
-                    result.TransId = result.InvoiceId;
 
                     //Cập nhật thuế suất
                     if (result.InfoND123.ListVat.Count > 1) { result.VatRate = null; }
@@ -888,10 +820,11 @@ namespace WindowsFormsApp1.Models
             }
             catch (Exception ex)
             {
-                Logger.Log(ex.Message);
+                LogUtil.LogError(ex);
             }
             return null;
         }
+
         private List<InvoiceItemInfo> MappingItemTaxaxionToInbot(List<HangHoaDVu> details)
         {
             var result = new List<InvoiceItemInfo>();
@@ -931,10 +864,11 @@ namespace WindowsFormsApp1.Models
             }
             catch (Exception ex)
             {
-                Logger.Log(ex.Message);
+                LogUtil.LogError(ex);
             }
             return result;
         }
+
         private ND123Info MappingND123InfoTaxaxionToInbot(HoaDon data)
         {
             var result = new ND123Info();
@@ -942,7 +876,7 @@ namespace WindowsFormsApp1.Models
             {
                 //Map danh sách tổng hợp thuế
                 var vatInfos = new List<VatInfo>();
-                if (data != null && data.TongHopThueSuat != null && data.TongHopThueSuat.Count > 0)
+                if (data.TongHopThueSuat != null && data.TongHopThueSuat.Count > 0)
                 {
                     foreach (var item in data.TongHopThueSuat)
                     {
@@ -1025,17 +959,18 @@ namespace WindowsFormsApp1.Models
                     }).OrderBy(x => x.ChangeDate).ToList();
                 }
             }
-            catch (Exception)
+            catch (Exception ex)
             {
-
+                LogUtil.LogError(ex);
             }
             return result;
         }
+
         private List<OtherInfo> MappingOtherInfors(List<TTinKhac> tTinKhacs)
         {
             try
             {
-                if (tTinKhacs == null && tTinKhacs.Count <= 0) return null;
+                if (tTinKhacs == null || tTinKhacs.Count <= 0) return null;
                 var otherInfos = new List<OtherInfo>();
                 foreach (var tTinKhac in tTinKhacs)
                 {
@@ -1045,12 +980,13 @@ namespace WindowsFormsApp1.Models
                 }
                 return otherInfos;
             }
-            catch (Exception)
+            catch (Exception ex)
             {
-
+                LogUtil.LogError(ex);
             }
             return null;
         }
+
         private decimal? GetVatRate(string stringVatRate, Action<bool> vatOtherCallback)
         {
             try
@@ -1098,432 +1034,11 @@ namespace WindowsFormsApp1.Models
             }
             catch (Exception ex)
             {
-                Logger.Log(ex.Message);
+                LogUtil.LogError(ex);
             }
             return null;
         }
-
-        public async Task<HoaDon> GetInvoiceDetail(Dictionary<string, string> queryParams, string linkGetDetail)
-        {
-            ResetHeaderContent();
-            try
-            {
-                Logger.Log("GetInvoiceDetail_Start post no XML");
-                // build param
-                string queryString = string.Join("&", queryParams.Select(kvp => $"{kvp.Key}={kvp.Value}"));
-                string urlWithParams = linkGetDetail + "?" + queryString;
-                var response = await CommonPattern.RetryOperationAsync(async () =>
-                {
-                    var httpResponse = await _client.GetAsync(urlWithParams);
-                    if (!httpResponse.IsSuccessStatusCode)
-                    {
-                        throw new Exception($"HTTP request failed with status code {httpResponse.StatusCode}");
-                    }
-                    return httpResponse;
-                });
-                response.EnsureSuccessStatusCode();
-                string stringContent = response.Content.ReadAsStringAsync().Result;
-                Logger.Log("GetInvoiceDetail_Start post no XML Success");
-                return JsonConvert.DeserializeObject<HoaDon>(stringContent);
-            }
-            catch (Exception ex)
-            {
-                Logger.Log(ex.Message);
-                throw ex;
-            }
-        }
-
-        /// <summary>
-        /// Lấy hóa đơn theo khoảng thời gian
-        /// </summary>
-        /// <param name="baseUrl"></param>
-        /// <param name="request"></param>
-        /// <param name="currentDate"></param>
-        /// <param name="endDate"></param>
-        /// <returns></returns>
-        private async Task<List<InvoicesResponse>> FetchInvoiceListAsync(string baseUrl, InvoiceInfoRequest request, DateTime currentDate, DateTime endDate)
-        {
-            ResetHeaderContent();
-
-            // Tạo biểu thức tìm kiếm cho ngày hiện tại
-            var textSearch = $"tdlap=ge={currentDate:dd/MM/yyyyT00:00:00};tdlap=le={endDate:dd/MM/yyyyT23:59:59}";
-
-
-            // Trạng thái hóa đơn
-            if (request.InvoiceStatus != 0)
-            {
-                textSearch += $";tthai=={request.InvoiceStatus}";
-            }
-
-            // Kết quả kiểm tra hóa đơn
-            if (request.InvoiceCheckResult != -1)
-            {
-                // nếu khác tất cả
-                textSearch += $";ttxly=={request.InvoiceCheckResult}";
-            }
-            else
-            {
-                // Nếu khác tất cả và là hóa đơn mua vào thì lấy cả 3 trạng thái
-                // 5: "Đã cấp mã hóa đơn",
-                // 6: "Tổng cục thuế đã nhận không mã",
-                // 8: "Tổng cục thuế đã nhận hóa đơn có mã khởi tạo từ máy tính tiền"
-                if (request.EinvoiceTab == 1)
-                {
-                    textSearch += $";ttxly=in=(5,6,8)";
-                }
-            }
-
-            if (request.IsPaymentOrder && (baseUrl == DownloadEinvoiceSetting.LinkSoldInvoices || baseUrl == DownloadEinvoiceSetting.LinkPurchaseInvoices))
-            {
-                textSearch += $";unhiem==1";
-            }
-
-            var queryParams = new Dictionary<string, string>
-            {
-                { "sort", "tdlap:desc,khmshdon:asc,shdon:desc" },
-                { "size", $"{request.Take}" },
-                { "search", textSearch }
-            };
-
-            // Build parameter
-            string urlWithParams = BuildQueryParam(baseUrl, queryParams);
-
-            // check xem có trang tiếp theo hay không
-            bool hasNextState = true;
-            // state của kết quả trả về hiện tại là param của trang sau
-            string currentState = null;
-            // danh sách hóa đơn của tháng đó 
-            List<InvoicesResponse> invoicesInRange = new List<InvoicesResponse>();
-
-            while (hasNextState)
-            {
-                // build lại param lấy trang tiếp theo dựa trên state
-                if (!string.IsNullOrEmpty(currentState))
-                {
-                    queryParams["state"] = currentState;
-                    urlWithParams = BuildQueryParam(baseUrl, queryParams);
-                }
-
-                try
-                {
-                    var stringContent = "";
-                    var response = await CommonPattern.RetryOperationAsync(async () =>
-                    {
-                        var httpResponse = await _client.GetAsync(urlWithParams);
-                        stringContent = await httpResponse.Content.ReadAsStringAsync();
-                        if (!httpResponse.IsSuccessStatusCode)
-                        {
-                            throw new Exception($"FetchInvoiceListAsync failed with status code {httpResponse.StatusCode} - Message: {stringContent} - {JsonConvert.SerializeObject(queryParams)}");
-                        }
-                        httpResponse.EnsureSuccessStatusCode();
-                        return httpResponse;
-                    });
-
-                    var invoiceResponse = JsonConvert.DeserializeObject<InvoicesResponse>(stringContent);
-                    currentState = invoiceResponse.State;
-
-                    // Thêm hóa đơn vào danh sách
-                    invoicesInRange.Add(invoiceResponse);
-                    hasNextState = !string.IsNullOrEmpty(currentState) && request.Take != 1;
-                    Logger.Log($"Get invoices params: {urlWithParams} success");
-                }
-                catch (Exception ex)
-                {
-                    hasNextState = false;
-                    Logger.Log(ex.Message);
-                    throw ex;
-                }
-            }
-
-            return invoicesInRange;
-        }
-
-        private SemaphoreSlim semaphore = new SemaphoreSlim(15);
-
-        /// <summary>
-        /// Tải XML
-        /// </summary>
-        /// <param name="requests"></param>
-        /// <param name="progressBarManager"></param>
-        /// <returns></returns>
-        public async Task<List<string>> DownloadXmlAsync(List<HoaDon> invoices, RequestSyncTaxAuthority syncRequest)
-        {
-            // tạo folder lưu file xml, pdf phục vụ sau này
-            string folderPath = $"{Application.StartupPath}/HDDT/{_username}/Invoices";
-            if (!Directory.Exists(folderPath))
-            {
-                Directory.CreateDirectory(folderPath);
-            }
-
-            var httpClient = new HttpClient();
-            httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", syncRequest.Authorization);
-            httpClient.DefaultRequestHeaders.Add("X-Misa-Context", syncRequest.XMISAContext);
-
-            // số lượng tải thành công
-            int totalSuccess = 0;
-            // số lượng tải thất bại
-            int totalError = 0;
-
-            // Create a list to store the tasks for downloading XML files
-            var downloadTasks = new List<string>();
-
-            for (int i = 0; i < invoices.Count; i++)
-            {
-                try
-                {
-                    //await semaphore.WaitAsync(); // Chờ cho đến khi có một vị trí trống để chạy một Task
-                    var invoice = invoices[i];
-
-                    var queryParams = new Dictionary<string, string> {
-                            { "nbmst", invoice.MSTNBan }, // MSTNBan
-                            { "khhdon", invoice.KyHieuHDon }, // Series
-                            { "shdon", invoice.SoHDon }, // InvoiceNo
-                            { "khmshdon", invoice.KyHieuMSoHDon.ToString() } // TemplateNo
-                        };
-
-                    // check xem nếu trong ký hiệu hóa đơn ký tự thứ 3 là M thì thay đổi link tải
-                    var linkExportXml = invoice.KyHieuHDon.IndexOf("M") == 3 ? DownloadEinvoiceSetting.LinkExportXmlFromCashRegister : DownloadEinvoiceSetting.LinkExportXml;
-
-                    // build query param
-                    string urlWithParams = BuildQueryParam(linkExportXml, queryParams);
-
-                    // tải xml, nếu sau 10 lần tải thất bại sẽ trả về exception do lỗi
-                    // trả về task là string
-                    var response = await CommonPattern.RetryOperationAsync(async () =>
-                    {
-                        Logger.Log($"DownloadXmlAsync_{urlWithParams}");
-                        // reset lại header mới cho mỗi lần tải
-                        ResetHeaderContent();
-                        // thời gian tải xml timeout tối đa là 2s
-                        _client.Timeout = TimeSpan.FromSeconds(2);
-                        var httpResponse = await _client.GetAsync(urlWithParams);
-
-                        if (!httpResponse.IsSuccessStatusCode)
-                        {
-                            string errorContent = await httpResponse.Content.ReadAsStringAsync();
-                            if (!string.IsNullOrEmpty(errorContent))
-                            {
-                                var errorMessage = JsonConvert.DeserializeObject<BaseTaxaxionResponse>(errorContent);
-                                if (!string.IsNullOrEmpty(errorMessage.Message))
-                                {
-                                    //if (errorMessage.Message.ToLower().Contains("không tồn tại hồ sơ gốc của hóa đơn"))
-                                    //{
-                                    //    Logger.Log($"XML Does not exists {JsonConvert.SerializeObject(queryParams)}");
-                                    //}
-                                    //else
-                                    //{
-
-                                    //}
-                                    totalError++;
-                                    // break retry luôn nếu không tìm thấy thông tin hóa đơn
-                                    throw new DownloadXMLException($"DownloadXmlAsync_Response from HDDT : {errorMessage.Message} - {JsonConvert.SerializeObject(queryParams)}");
-                                }
-                            }
-                            else
-                            {
-                                throw new Exception($"DownloadXmlAsync_Request failed with status code {httpResponse.StatusCode} - {JsonConvert.SerializeObject(queryParams)}");
-                            }
-                        }
-
-                        httpResponse.EnsureSuccessStatusCode();
-                        return httpResponse;
-                    });
-
-                    byte[] responseBodyBytes = await response.Content.ReadAsByteArrayAsync();
-                    downloadTasks.Add(ExtractToXml(responseBodyBytes, invoice, folderPath, httpClient, syncRequest));
-                    Logger.Log($"DownloadXmlAsync_{urlWithParams} - success");
-
-                    totalSuccess++;
-                    // tải 5 cái delay 0.5s
-                    if ((i + 1) % 5 == 0)
-                    {
-                        await Task.Delay(500);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    totalError++;
-                    Logger.Log($"DownloadXmlAsync_{ex.Message}");
-                }
-            }
-            Logger.Log($"DownloadXmlAsync_Finish to download xml: {totalSuccess}/{invoices.Count()} - Failed: {totalError}");
-            Logger.Log($"{JsonConvert.SerializeObject(downloadTasks.ToList())}");
-            return downloadTasks.ToList();
-        }
-
-        /// <summary>
-        /// Giải nén folder và tìm ra file xml để gửi sang kế toán
-        /// </summary>
-        /// <param name="zipData"></param>
-        /// <param name="request"></param>
-        /// <returns></returns>
-        private string ExtractToXml(byte[] zipData, HoaDon request, string folderPath, HttpClient httpClient, RequestSyncTaxAuthority syncRequest)
-        {
-            try
-            {
-                // gửi formData
-                // giải nén file
-                using (var zipStream = new MemoryStream(zipData))
-                using (var archive = new ZipArchive(zipStream, ZipArchiveMode.Read))
-                {
-                    // Duyệt qua các file trong file zip để tìm html và xml
-                    foreach (var entry in archive.Entries)
-                    {
-                        // lấy ra extention
-                        var extension = Path.GetExtension(entry.Name);
-                        // lấy ra tên file
-                        var fileName = Path.GetFileName(entry.Name);
-                        var tmpXmlFolder = $"{folderPath}/{request.MSTNBan}";
-                        if (!Directory.Exists(tmpXmlFolder))
-                        {
-                            Directory.CreateDirectory(tmpXmlFolder);
-                        }
-                        string filePath = $"{tmpXmlFolder}/{request.KyHieuMSoHDon}_{request.KyHieuHDon}_{request.SoHDon}_{fileName}";
-                        if (extension.ToLower() == ".xml")
-                        {
-                            using (var fileStream = entry.Open())
-                            using (var reader = new StreamReader(fileStream, Encoding.UTF8)) // Use UTF-8 encoding for XML
-                            {
-                                string xmlContent = reader.ReadToEnd();
-                                return xmlContent;
-                            }
-                            //using (var fileStream = entry.Open())
-                            //using (var memoryStream = new MemoryStream())
-                            //{
-                            //    fileStream.CopyTo(memoryStream);
-                            //    byte[] fileBytes = memoryStream.ToArray();
-                            //    File.WriteAllBytes(filePath, fileBytes);
-                            //    semaphore.Release();
-                            //    return fileBytes;
-                            //}
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Logger.Log(ex.Message);
-                throw ex;
-            }
-            return null;
-        }
-
-        /// <summary>
-        /// Đồng bộ danh sách hóa đơn từ CQT
-        /// </summary>
-        /// <param name="message"></param>
-        /// <returns></returns>
-        public async Task<List<HoaDon>> SyncInvoiceInRange(RequestSyncTaxAuthority syncRequest)
-        {
-            try
-            {
-                ResetHeaderContent();
-                // tham số để lấy hóa đơn
-                InvoiceInfoRequest request = new InvoiceInfoRequest()
-                {
-                    StartDate = syncRequest.StartDate,
-                    EndDate = syncRequest.EndDate,
-                    EinvoiceTab = syncRequest.IsSyncFromInputInvoice ? 1 : 0,
-                    IsPaymentOrder = syncRequest.IsPaymentOrder,
-                };
-
-                var httpClient = new HttpClient();
-                httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", syncRequest.Authorization);
-                httpClient.DefaultRequestHeaders.Add("X-Misa-Context", syncRequest.XMISAContext);
-
-                //Logger.Log($"SyncInvoiceInRange_Request Client {JsonConvert.SerializeObject(_client)}");
-                //Logger.Log($"SyncInvoiceInRange_Request Client to ASP {JsonConvert.SerializeObject(httpClient)}");
-                //Logger.Log($"SyncInvoiceInRange_Request param {JsonConvert.SerializeObject(request)}");
-
-
-                string linkInvoice = $"{DownloadEinvoiceSetting.LinkPurchaseInvoices}";
-                string linkInvoiceFromCashRegister = $"{DownloadEinvoiceSetting.LinkPurchaseInvoicesFromCashRegister}";
-
-                // nếu là hóa đơn bán ra thì sửa lại link lấy trên danh sách
-                if (request.EinvoiceTab == 0)
-                {
-                    linkInvoice = $"{DownloadEinvoiceSetting.LinkSoldInvoices}";
-                    linkInvoiceFromCashRegister = $"{DownloadEinvoiceSetting.LinkSoldInvoicesFromCashRegister}";
-                }
-
-                // hóa đơn thường
-                List<InvoicesResponse> invoices = new List<InvoicesResponse>();
-                // hóa đơn khởi tạo từ máy tính tiền
-                List<InvoicesResponse> invoicesFromCashRegister = new List<InvoicesResponse>();
-
-                DateTime currentDate = request.StartDate.Date;
-                DateTime endDate = request.EndDate.Date;
-
-                var lstXMLDownload = new List<HoaDon>();
-
-                // Lấy Hóa đơn điện tử
-                invoices = await FetchInvoiceListAsync(linkInvoice, request, currentDate, endDate);
-
-                if (invoices != null && invoices.Count > 0)
-                {
-                    invoices.ForEach(x =>
-                    {
-                        lstXMLDownload.AddRange(x.Datas);
-                    });
-                }
-
-                // Nếu không phải hóa đơn ủy nhiệm và có hóa đơn khởi tạo từ máy tính tiền
-                if (!request.IsPaymentOrder)
-                {
-                    invoicesFromCashRegister = await FetchInvoiceListAsync(linkInvoiceFromCashRegister, request, currentDate, endDate);
-
-                    if (invoicesFromCashRegister != null && invoicesFromCashRegister.Count > 0)
-                    {
-                        invoicesFromCashRegister.ForEach(x =>
-                        {
-                            lstXMLDownload.AddRange(x.Datas);
-                        });
-                    }
-                }
-
-                // mapping list inv crwal được sang bên inbot
-                var invoiceBotMapping = MappingTaxaxionToInbot(lstXMLDownload, syncRequest);
-
-                // DOWNLOAD XML 
-                List<string> lstXmlString = null;
-                if (lstXMLDownload.Count > 0)
-                {
-                    lstXmlString = await DownloadXmlAsync(lstXMLDownload, syncRequest);
-                }
-
-                Logger.Log($"{currentDate} - Total: {lstXMLDownload.Count}");
-
-                return lstXMLDownload;
-
-                //await CommonPattern.RetryOperationAsync(async () =>
-                //{
-                //    var taxAuthorityResponse = new TaxAuthoritySyncMaster
-                //    {
-                //        CreatedDate = currentDate,
-                //        TaxCode = syncRequest.TaxCode,
-                //        SubscriberId = syncRequest.SubscriberId,
-                //        OrganizationId = syncRequest.OrganizationId,
-                //        TotalCrawl = invoiceBotMapping.Count,
-                //        TotalResponse = invoices.FirstOrDefault().Total.Value + invoicesFromCashRegister.FirstOrDefault().Total.Value,
-                //        Invoices = invoiceBotMapping,
-                //        Id = BuildSyncHistoryMasterId(syncRequest.SubscriberId, syncRequest.OrganizationId, currentDate)
-                //    };
-
-                //    var byteContent = new ByteArrayContent(Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(taxAuthorityResponse)));
-                //    byteContent.Headers.ContentType = new MediaTypeHeaderValue("application/json");
-                //    var response = await httpClient.PostAsync(syncRequest.APIUpdateHistoryMaster, byteContent);
-                //    response.EnsureSuccessStatusCode();
-                //    isPostSuccess = true;
-                //    Logger.Log($"Finished to post Invoice {currentDate} - Total: {lstXMLDownload.Count} - Total In HDDT: {invoices.Sum(x => x.Total) + invoicesFromCashRegister.Sum(x => x.Total)}");
-                //    return response;
-                //});
-            }
-            catch (Exception ex)
-            {
-                Logger.Log(ex.Message);
-                throw ex;
-            }
-        }
+        #endregion
         private string BuildInvoiceId(string invoiceNo, string templateNo, string series, DateTime invoiceDate, string sellerTaxCode)
         {
             // Kết hợp thông tin vào một chuỗi
@@ -1546,6 +1061,5 @@ namespace WindowsFormsApp1.Models
                 return uniqueId;
             }
         }
-
     }
 }
