@@ -1,7 +1,7 @@
 <!-- Cấu hình dự án Decaptcha -->
-		<!-- <add key="DeCaptcha_Api_Url" value="https://aiservice.misa.vn/v2/captcha-decode/"/> -->
-		<add key="DeCaptcha_Api_Url" value="https://aiservice.misa.vn/v1/captcha-decode/"/>
-		<!-- <add key="DeCaptcha_Api_Key" value="RDtZbUSo5yPYsOBmU4utkLDGH9p5qGFE" /> -->
-		<add key="DeCaptcha_Api_Key" value="P4wrZDzouW50s8xfpD5E26Fe3MPbX3G0" />
-		<!-- <add key="DeCaptcha_Project" value="misa-asp" /> -->
-		<add key="DeCaptcha_Project" value="invoice-scanner" />
+<!-- <add key="DeCaptcha_Api_Url" value="https://aiservice.misa.vn/v2/captcha-decode/"/> -->
+<add key="DeCaptcha_Api_Url" value="https://aiservice.misa.vn/v1/captcha-decode/"/>
+<!-- <add key="DeCaptcha_Api_Key" value="RDtZbUSo5yPYsOBmU4utkLDGH9p5qGFE" /> -->
+<add key="DeCaptcha_Api_Key" value="P4wrZDzouW50s8xfpD5E26Fe3MPbX3G0" />
+<!-- <add key="DeCaptcha_Project" value="misa-asp" /> -->
+<add key="DeCaptcha_Project" value="invoice-scanner" />
