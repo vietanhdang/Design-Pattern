@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Prompt Generator</title>
+    <style>
+        body {
+            text-align: center;
+            background-color: whitesmoke;
+        }
+
+        #phrase {
+            padding: 15px;
+            width: 20%;
+            border: 5px solid rgb(49, 47, 68);
+            text-align: center;
+        }
+
+        #prompt-holder {
+            width: 50%;
+            height: 50%;
+            margin: 0 auto;
+            border: 5px solid rgb(50, 31, 221);
+            padding: 20px;
+            text-align: center;
+            background-color: rgb(246, 247, 248)
+        }
+    </style>
+</head>
+
+<body>
+    <h3><strong>AI BREAK CAPTCHA GENERATOR</strong></h3>
+    <br><br>
+    <div id="img-input">
+        <input type="file" id="file-input" accept="image/*" multiple>
+    </div>
+    <br><br><br><br>
+    <button id="run"><strong>Generate Prompt</strong></button>
+    <br><br><br><br><br>
+    <div id="prompt-holder"></div>
+</body>
+
+<script type="module" src="https://cdn.jsdelivr.net/npm/@gradio/client@0.1.4/dist/index.min.js"></script>
+<script type="module">
+    import { client } from "https://cdn.jsdelivr.net/npm/@gradio/client@0.1.4/dist/index.min.js";
+    const fileInput = document.getElementById("file-input");
+    const generate = document.getElementById("run");
+    const prompt_holder = document.getElementById("prompt-holder");
+    var success = 0,
+        failed = 0;
+
+    generate.addEventListener("click", async () => {
+        try {
+            success = 0;
+            failed = 0;
+            const app = await client("https://docparser-text-captcha-breaker.hf.space/");
+            let images = fileInput.files;
+            let files = [];
+            for (let i = 0; i < images.length; i++) {
+                let image = images[i];
+                let oldName = image.name;
+                let newName = "";
+                try {
+                    const result = await app.predict("/predict", [
+                        image
+                    ]);
+                    success++;
+                    newName = result.data[0];
+                } catch (error) {
+                    failed++;
+                } finally {
+                    prompt_holder.textContent = "Status: " + success + " Success, " + failed + " Failed";
+                    files.push({ oldName, newName });
+                }
+            }
+            console.log(files);
+            alert("Decaptcha Complete");
+
+        } catch (error) {
+            console.log("Error:", error.message);
+        }
+    });
+
+    // generate.addEventListener("click", async () => {
+    //     try {
+    //         success = 0;
+    //         failed = 0;
+    //         const app = await client("https://docparser-text-captcha-breaker.hf.space/");
+    //         let images = fileInput.files;
+
+    //         // Sử dụng Promise.all để đợi cho tất cả các yêu cầu dự đoán được giải quyết
+    //         const results = await Promise.all(Array.from(images).map(async (image) => {
+    //             let oldName = image.name;
+    //             let newName = "";
+    //             try {
+    //                 const result = await app.predict("/predict", [image]);
+    //                 success++;
+    //                 newName = result.data[0];
+    //             } catch (error) {
+    //                 failed++;
+    //             } finally {
+    //                 prompt_holder.textContent = "Status: " + success + " Success, " + failed + " Failed";
+    //                 return { oldName, newName };
+    //             }
+    //         }));
+
+    //         console.log(results);
+    //         alert("Decaptcha Complete");
+
+    //     } catch (error) {
+    //         console.log("Error:", error.message);
+    //     }
+    // });
+
+</script>
+
+</html>
